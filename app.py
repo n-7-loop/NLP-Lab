@@ -1,190 +1,226 @@
 import streamlit as st
 import PyPDF2
+from sentence_transformers import SentenceTransformer
+import faiss
 import numpy as np
 import nltk
-import torch
-
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 from collections import Counter
+import requests
+import json
 
-# -------------------- NLTK --------------------
+# Download NLTK stopwords
 try:
-    nltk.data.find("corpora/stopwords")
+    nltk.data.find('corpora/stopwords')
 except LookupError:
-    nltk.download("stopwords", quiet=True)
+    nltk.download('stopwords', quiet=True)
 
 from nltk.corpus import stopwords
 
-# -------------------- SESSION STATE --------------------
-if "processed" not in st.session_state:
+# HuggingFace API Configuration
+HF_API_TOKEN = "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"
+HF_API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-large"
+
+# Session state initialization
+if 'processed' not in st.session_state:
     st.session_state.processed = False
-if "chat_history" not in st.session_state:
+if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
-if "embeddings" not in st.session_state:
-    st.session_state.embeddings = None
-if "chunks" not in st.session_state:
+if 'vector_store' not in st.session_state:
+    st.session_state.vector_store = None
+if 'chunks' not in st.session_state:
     st.session_state.chunks = []
-if "stats" not in st.session_state:
+if 'stats' not in st.session_state:
     st.session_state.stats = {}
-if "full_text" not in st.session_state:
+if 'full_text' not in st.session_state:
     st.session_state.full_text = ""
 
-# -------------------- MODELS --------------------
 @st.cache_resource
 def load_embedding_model():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    """Load sentence embedding model"""
+    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
-@st.cache_resource
-def load_llm():
-    model_name = "google/flan-t5-small"  # smaller = safer on Streamlit Cloud
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+def query_huggingface_api(payload):
+    """Query HuggingFace API"""
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    try:
+        response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"API returned status code {response.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
-    device = 0 if torch.cuda.is_available() else -1
-    return pipeline(
-        "text2text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_length=256,
-        do_sample=False,
-    )
-
-# -------------------- PDF PROCESSING --------------------
 def extract_text_from_pdf(pdf_file):
-    reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + " "
-    return text.strip(), len(reader.pages)
+    """Extract text from PDF"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        page_count = len(pdf_reader.pages)
+        for page in pdf_reader.pages:
+            text += page.extract_text() + " "
+        return text.strip(), page_count
+    except Exception as e:
+        st.error(f"PDF reading error: {str(e)}")
+        return None, 0
 
-def chunk_text(text, chunk_size=700, overlap=100):
+def chunk_text(text, chunk_size=700):
+    """Split text into chunks with overlap"""
     words = text.split()
     chunks = []
+    overlap = 100
     for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i:i + chunk_size])
+        chunk = ' '.join(words[i:i + chunk_size])
         if chunk.strip():
             chunks.append(chunk)
     return chunks
 
 def calculate_statistics(text, page_count):
+    """Generate document statistics"""
     words = text.split()
-    stop_words = set(stopwords.words("english"))
-
-    filtered = [
-        w.lower()
-        for w in words
-        if w.isalpha() and len(w) > 2 and w.lower() not in stop_words
-    ]
-
+    word_count = len(words)
+    avg_words = word_count / page_count if page_count > 0 else 0
+    
+    # Top frequent words (excluding stopwords)
+    stop_words = set(stopwords.words('english'))
+    filtered = [w.lower() for w in words if w.isalpha() and len(w) > 2 and w.lower() not in stop_words]
+    top_words = Counter(filtered).most_common(10)
+    
     return {
-        "page_count": page_count,
-        "word_count": len(words),
-        "avg_words_per_page": round(len(words) / page_count, 2) if page_count else 0,
-        "top_words": Counter(filtered).most_common(10),
+        'page_count': page_count,
+        'word_count': word_count,
+        'avg_words_per_page': round(avg_words, 2),
+        'top_words': top_words
     }
 
-# -------------------- VECTOR SEARCH (NO FAISS) --------------------
-def create_embeddings(chunks, model):
-    return model.encode(chunks, show_progress_bar=False)
+def create_vector_store(chunks, model):
+    """Create FAISS index"""
+    embeddings = model.encode(chunks, show_progress_bar=False)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings).astype('float32'))
+    return index
 
-def retrieve_chunks(query, model, embeddings, chunks, k=4):
-    query_embedding = model.encode([query])
-    scores = cosine_similarity(query_embedding, embeddings)[0]
-    top_indices = np.argsort(scores)[-k:][::-1]
-    return [chunks[i] for i in top_indices]
+def retrieve_chunks(query, model, index, chunks, k=4):
+    """Retrieve relevant chunks"""
+    query_embedding = model.encode([query], show_progress_bar=False)
+    _, indices = index.search(np.array(query_embedding).astype('float32'), k)
+    return [chunks[i] for i in indices[0] if i < len(chunks)]
 
-# -------------------- LLM --------------------
-def generate_response(query, context_chunks, llm):
+def generate_response(query, context_chunks):
+    """Generate response using HuggingFace API"""
     context = "\n\n".join(context_chunks[:3])
-    prompt = f"""
-You are a helpful hostel assistant.
+    
+    prompt = f"""As a helpful hostel assistant, based on the following context from the hostel PDF:
 
-Context:
-{context}
+Context: {context[:1000]}
 
-Question:
-{query}
-"""
+Question: {query}
 
-    response = llm(prompt)[0]["generated_text"]
-    return response.strip()
+Answer:"""
+    
+    result = query_huggingface_api({"inputs": prompt, "parameters": {"max_length": 300, "temperature": 0.7}})
+    
+    if "error" in result:
+        return f"**Relevant information from document:**\n\n{context[:600]}...\n\n*API Error: {result['error']}*"
+    
+    try:
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get('generated_text', context[:500])
+        else:
+            return context[:500]
+    except:
+        return context[:500]
 
-def generate_summary(text, llm):
-    prompt = f"Summarize this hostel document in 2–3 sentences:\n\n{text[:1500]}"
-    return llm(prompt)[0]["generated_text"].strip()
+def generate_summary(text):
+    """Generate document summary using HuggingFace API"""
+    prompt = f"Summarize the following hostel document in 2-3 sentences, highlighting key facilities and policies:\n\n{text[:1500]}"
+    
+    result = query_huggingface_api({"inputs": prompt, "parameters": {"max_length": 150, "temperature": 0.5}})
+    
+    if "error" in result:
+        return f"Summary generation failed: {result['error']}"
+    
+    try:
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get('generated_text', "Summary generation failed")
+        else:
+            return "Summary generation failed"
+    except:
+        return "Summary generation failed"
 
-# -------------------- UI --------------------
-st.set_page_config("Hostel RAG Chat", "🏨", layout="wide")
+# Streamlit UI
+st.set_page_config(page_title="Hostel RAG Chat", page_icon="🏨", layout="wide")
 st.title("🏨 Hostel Document Chat Assistant")
+st.markdown("*Upload hostel PDF and ask questions about policies, facilities, and rules*")
 
+# Sidebar
 with st.sidebar:
-    st.header("📄 Upload PDF")
-    uploaded_file = st.file_uploader("Upload hostel PDF", type="pdf")
-
-    if uploaded_file and st.button("Process Document"):
-        with st.spinner("Processing..."):
+    st.header("📄 Document Upload")
+    uploaded_file = st.file_uploader("Upload Hostel PDF", type=['pdf'])
+    
+    if uploaded_file and st.button("Process Document", type="primary"):
+        with st.spinner("Processing PDF..."):
             text, pages = extract_text_from_pdf(uploaded_file)
-            st.session_state.full_text = text
-            st.session_state.chunks = chunk_text(text)
-            st.session_state.stats = calculate_statistics(text, pages)
-
-            embed_model = load_embedding_model()
-            st.session_state.embeddings = create_embeddings(
-                st.session_state.chunks, embed_model
-            )
-
-            st.session_state.processed = True
-            st.success("Document processed successfully!")
-
+            
+            if text:
+                st.session_state.full_text = text
+                st.session_state.chunks = chunk_text(text)
+                st.session_state.stats = calculate_statistics(text, pages)
+                
+                embed_model = load_embedding_model()
+                st.session_state.vector_store = create_vector_store(st.session_state.chunks, embed_model)
+                st.session_state.processed = True
+                st.success("✅ Document processed successfully!")
+    
     if st.session_state.processed:
         st.divider()
-        st.header("📊 Document Stats")
-        s = st.session_state.stats
-        st.metric("Pages", s["page_count"])
-        st.metric("Words", s["word_count"])
-        st.metric("Avg Words/Page", s["avg_words_per_page"])
-
-        st.subheader("Top Keywords")
-        for w, c in s["top_words"]:
-            st.write(f"• {w}: {c}")
-
+        st.header("📊 Hostel Document Stats")
+        stats = st.session_state.stats
+        
+        col1, col2 = st.columns(2)
+        col1.metric("Total Pages", stats['page_count'])
+        col2.metric("Total Words", f"{stats['word_count']:,}")
+        st.metric("Avg Words/Page", stats['avg_words_per_page'])
+        
+        st.subheader("Top 10 Keywords")
+        for word, count in stats['top_words']:
+            st.text(f"• {word.capitalize()}: {count}")
+        
+        st.divider()
         if st.button("📝 Generate Summary"):
-            llm = load_llm()
-            st.info(generate_summary(st.session_state.full_text, llm))
+            with st.spinner("Generating summary..."):
+                summary = generate_summary(st.session_state.full_text)
+                st.info(f"**Summary:** {summary}")
 
-# -------------------- CHAT --------------------
-st.header("💬 Chat")
+# Main chat interface
+st.header("💬 Chat with Hostel Document")
 
 if not st.session_state.processed:
-    st.info("Upload and process a PDF to start chatting.")
+    st.info("👈 Please upload and process a PDF document to start chatting!")
 else:
-    for role, msg in st.session_state.chat_history:
+    # Display chat history
+    for role, message in st.session_state.chat_history:
         with st.chat_message(role):
-            st.write(msg)
-
-    query = st.chat_input("Ask about rules, facilities, check-in...")
+            st.write(message)
+    
+    # Chat input
+    query = st.chat_input("Ask about check-in times, facilities, rules, etc...")
+    
     if query:
         st.session_state.chat_history.append(("user", query))
         with st.chat_message("user"):
             st.write(query)
-
-        embed_model = load_embedding_model()
-        llm = load_llm()
-
-        context = retrieve_chunks(
-            query,
-            embed_model,
-            st.session_state.embeddings,
-            st.session_state.chunks,
-        )
-
-        answer = generate_response(query, context, llm)
-
-        st.session_state.chat_history.append(("assistant", answer))
+        
+        with st.spinner("Generating answer..."):
+            embed_model = load_embedding_model()
+            relevant = retrieve_chunks(query, embed_model, st.session_state.vector_store, st.session_state.chunks)
+            response = generate_response(query, relevant)
+        
+        st.session_state.chat_history.append(("assistant", response))
         with st.chat_message("assistant"):
-            st.write(answer)
-
+            st.write(response)
         st.rerun()
+
+st.divider()
+st.caption("💡 Example questions: 'What are the check-in procedures?' or 'What facilities are available?'")
